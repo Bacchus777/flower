@@ -20,6 +20,8 @@
 #include "bdb.h"
 #include "bdb_interface.h"
 #include "gp_interface.h"
+#include "bdb_touchlink.h"
+#include "bdb_touchlink_target.h"
 
 #include "Debug.h"
 
@@ -86,34 +88,33 @@ byte zclApp_TaskID;
  * LOCAL VARIABLES
  */
 
+afAddrType_t inderect_DstAddr = {.addrMode = (afAddrMode_t)AddrNotPresent, .endPoint = 0, .addr.shortAddr = 0};
+
 static uint8 currentSensorsReadingPhase = 0;
 
-afAddrType_t inderect_DstAddr = {.addrMode = (afAddrMode_t)AddrNotPresent, .endPoint = 0, .addr.shortAddr = 0};
-struct bme280_data bme_results;
-struct bme280_dev bme_dev = {.dev_id = BME280_I2C_ADDR_PRIM,
-                             .intf = BME280_I2C_INTF,
-                             .read = I2C_ReadMultByte,
-                             .write = I2C_WriteMultByte,
-                             .delay_ms = user_delay_ms};
 /*********************************************************************
  * LOCAL FUNCTIONS
  */
 static void zclApp_HandleKeys(byte shift, byte keys);
 static void zclApp_Report(void);
+static void zclApp_BasicResetCB(void);
+
+static void zclApp_RestoreAttributesFromNV(void);
+static void zclApp_SaveAttributesToNV(void);
+static ZStatus_t zclApp_ReadWriteAuthCB(afAddrType_t *srcAddr, zclAttrRec_t *pAttr, uint8 oper);
 
 static void zclApp_ReadSensors(void);
-static void zclApp_InitBME280(struct bme280_dev *dev);
-static void zclApp_ReadBME280(struct bme280_dev *dev);
 static void zclApp_ReadDS18B20(void);
 static void zclApp_ReadLumosity(void);
 static void zclApp_ReadSoilHumidity(void);
+static void zclApp_ReadOnOff(void);
 static void zclApp_InitPWM(void);
 
 /*********************************************************************
  * ZCL General Profile Callback table
  */
 static zclGeneral_AppCallbacks_t zclApp_CmdCallbacks = {
-    NULL, // Basic Cluster Reset command
+    zclApp_BasicResetCB, // Basic Cluster Reset command
     NULL, // Identify Trigger Effect command
     NULL, // On/Off cluster commands
     NULL, // On/Off cluster enhanced command Off with Effect
@@ -143,16 +144,18 @@ void zclApp_Init(byte task_id) {
     zcl_registerAttrList(zclApp_FirstEP.EndPoint, zclApp_AttrsFirstEPCount, zclApp_AttrsFirstEP);
     bdb_RegisterSimpleDescriptor(&zclApp_FirstEP);
 
-    zcl_registerAttrList(zclApp_SecondEP.EndPoint, zclApp_AttrsSecondEPCount, zclApp_AttrsSecondEP);
-    bdb_RegisterSimpleDescriptor(&zclApp_SecondEP);
-
     zcl_registerForMsg(zclApp_TaskID);
 
+    zcl_registerReadWriteCB(1, NULL, zclApp_ReadWriteAuthCB);
+
+    zclApp_RestoreAttributesFromNV();
     // Register for all key events - This app will handle all key events
     RegisterForKeys(zclApp_TaskID);
     LREP("Started build %s \r\n", zclApp_DateCodeNT);
+    
 
-    osal_start_reload_timer(zclApp_TaskID, APP_REPORT_EVT, APP_REPORT_DELAY);
+
+    osal_start_reload_timer(zclApp_TaskID, APP_REPORT_EVT, ((uint32) zclApp_Config.Interval * 60 * 1000));
 }
 
 uint16 zclApp_event_loop(uint8 task_id, uint16 events) {
@@ -192,9 +195,20 @@ uint16 zclApp_event_loop(uint8 task_id, uint16 events) {
         zclApp_ReadSensors();
         return (events ^ APP_READ_SENSORS_EVT);
     }
+    if (events & APP_SAVE_ATTRS_EVT) {
+        LREPMaster("APP_SAVE_ATTRS_EVT\r\n");
+        zclApp_SaveAttributesToNV();
+        return (events ^ APP_SAVE_ATTRS_EVT);
+    }
 
     // Discard unknown events
     return 0;
+}
+
+static void zclApp_BasicResetCB(void) {
+    LREPMaster("BasicResetCB\r\n");
+    zclApp_ResetAttributesToDefaultValues();
+    zclApp_SaveAttributesToNV();
 }
 
 static void zclApp_HandleKeys(byte portAndAction, byte keyCode) {
@@ -206,6 +220,32 @@ static void zclApp_HandleKeys(byte portAndAction, byte keyCode) {
         osal_start_timerEx(zclApp_TaskID, APP_REPORT_EVT, 200);
     }
 }
+
+static ZStatus_t zclApp_ReadWriteAuthCB(afAddrType_t *srcAddr, zclAttrRec_t *pAttr, uint8 oper) {
+    LREPMaster("AUTH CB called\r\n");
+    osal_start_timerEx(zclApp_TaskID, APP_SAVE_ATTRS_EVT, 2000);
+    return ZSuccess;
+}
+
+static void zclApp_SaveAttributesToNV(void) {
+    uint8 writeStatus = osal_nv_write(NW_APP_CONFIG, 0, sizeof(application_config_t), &zclApp_Config);
+    LREP("Saving attributes to NV write=%d\r\n", writeStatus);
+    osal_start_reload_timer(zclApp_TaskID, APP_REPORT_EVT, ((uint32) zclApp_Config.Interval * 60 * 1000));
+}
+
+static void zclApp_RestoreAttributesFromNV(void) {
+    uint8 status = osal_nv_item_init(NW_APP_CONFIG, sizeof(application_config_t), NULL);
+    LREP("Restoring attributes from NV  status=%d \r\n", status);
+    if (status == NV_ITEM_UNINIT) {
+        uint8 writeStatus = osal_nv_write(NW_APP_CONFIG, 0, sizeof(application_config_t), &zclApp_Config);
+        LREP("NV was empty, writing %d\r\n", writeStatus);
+    }
+    if (status == ZSUCCESS) {
+        LREPMaster("Reading from NV\r\n");
+        osal_nv_read(NW_APP_CONFIG, 0, sizeof(application_config_t), &zclApp_Config);
+    }
+}
+
 static void zclApp_InitPWM(void) {
     PERCFG &= ~(0x20); // Select Timer 3 Alternative 1 location
     P2SEL |= 0x20;
@@ -238,23 +278,22 @@ static void zclApp_ReadSensors(void) {
         POWER_ON_SENSORS();
         zclApp_ReadLumosity();
         break;
-
     case 1:
         zclBattery_Report();
         zclApp_ReadSoilHumidity();
         break;
     case 2:
-        zclApp_InitBME280(&bme_dev);
-        break;
-
-    case 3:
         zclApp_ReadDS18B20();
+        break;
+    case 3:
+        zclApp_ReadOnOff();
         break;
     default:
         POWER_OFF_SENSORS();
         currentSensorsReadingPhase = 0;
         break;
     }
+    LREP("currentSensorsReadingPhase %d\r\n", currentSensorsReadingPhase);
     if (currentSensorsReadingPhase != 0) {
         osal_start_timerEx(zclApp_TaskID, APP_READ_SENSORS_EVT, 10);
     }
@@ -270,7 +309,16 @@ static void zclApp_ReadSoilHumidity(void) {
         (uint16)mapRange(soilHumidityMinRangeAir, soilHumidityMaxRangeWater, 0.0, 10000.0, zclApp_SoilHumiditySensor_MeasuredValueRawAdc);
     LREP("ReadSoilHumidity raw=%d mapped=%d\r\n", zclApp_SoilHumiditySensor_MeasuredValueRawAdc, zclApp_SoilHumiditySensor_MeasuredValue);
 
-    bdb_RepChangedAttrValue(zclApp_FirstEP.EndPoint, SOIL_HUMIDITY, ATTRID_MS_RELATIVE_HUMIDITY_MEASURED_VALUE);
+    bdb_RepChangedAttrValue(zclApp_FirstEP.EndPoint, SOIL_MOISTURE, ATTRID_MS_RELATIVE_HUMIDITY_MEASURED_VALUE);
+}
+
+static void zclApp_ReadOnOff(void) {
+  LREP("zclApp_SoilHumiditySensor_MeasuredValue=%d\r\n", zclApp_SoilHumiditySensor_MeasuredValue);
+  LREP("zclApp_Config.Threshold=%d\r\n", zclApp_Config.Threshold);
+  zclApp_SoilHumiditySensor_Output = (zclApp_SoilHumiditySensor_MeasuredValue < (zclApp_Config.Threshold * 100));
+  if (zclApp_SoilHumiditySensor_Output) {
+    zclGeneral_SendOnOff_CmdOn(zclApp_FirstEP.EndPoint, &inderect_DstAddr, TRUE, bdb_getZCLFrameCounter());
+  }
 }
 
 static void zclApp_ReadDS18B20(void) {
@@ -278,7 +326,7 @@ static void zclApp_ReadDS18B20(void) {
     if (temp != 1) {
         zclApp_DS18B20_MeasuredValue = temp;
         LREP("ReadDS18B20 t=%d\r\n", zclApp_DS18B20_MeasuredValue);
-        bdb_RepChangedAttrValue(zclApp_SecondEP.EndPoint, TEMP, ATTRID_MS_TEMPERATURE_MEASURED_VALUE);
+        bdb_RepChangedAttrValue(zclApp_FirstEP.EndPoint, TEMP, ATTRID_MS_TEMPERATURE_MEASURED_VALUE);
     } else {
         LREPMaster("ReadDS18B20 error\r\n");
     }
@@ -306,47 +354,6 @@ static void _delay_us(uint16 microSecs) {
 
 void user_delay_ms(uint32_t period) { _delay_us(1000 * period); }
 
-static void zclApp_InitBME280(struct bme280_dev *dev) {
-    int8_t rslt = bme280_init(dev);
-    if (rslt == BME280_OK) {
-        uint8_t settings_sel;
-        dev->settings.osr_h = BME280_OVERSAMPLING_1X;
-        dev->settings.osr_p = BME280_OVERSAMPLING_16X;
-        dev->settings.osr_t = BME280_OVERSAMPLING_2X;
-        dev->settings.filter = BME280_FILTER_COEFF_16;
-        dev->settings.standby_time = BME280_STANDBY_TIME_62_5_MS;
-
-        settings_sel = BME280_OSR_PRESS_SEL;
-        settings_sel |= BME280_OSR_TEMP_SEL;
-        settings_sel |= BME280_OSR_HUM_SEL;
-        settings_sel |= BME280_STANDBY_SEL;
-        settings_sel |= BME280_FILTER_SEL;
-        rslt = bme280_set_sensor_settings(settings_sel, dev);
-        rslt = bme280_set_sensor_mode(BME280_NORMAL_MODE, dev);
-
-        uint32_t req_delay = bme280_cal_meas_delay(&dev->settings);
-        dev->delay_ms(req_delay);
-
-        zclApp_ReadBME280(dev);
-    } else {
-        LREP("ReadBME280 init error %d\r\n", rslt);
-    }
-}
-static void zclApp_ReadBME280(struct bme280_dev *dev) {
-    int8_t rslt = bme280_get_sensor_data(BME280_ALL, &bme_results, dev);
-    if (rslt == BME280_OK) {
-        zclApp_Temperature_Sensor_MeasuredValue = (int16)bme_results.temperature;
-        zclApp_PressureSensor_ScaledValue = (int16)(pow(10.0, (double)zclApp_PressureSensor_Scale) * (double)bme_results.pressure);
-        zclApp_PressureSensor_MeasuredValue = bme_results.pressure / 100;
-        LREP("ReadBME280 t=%ld, p=%ld h=%ld\r\n", bme_results.temperature, bme_results.pressure, bme_results.humidity);
-        zclApp_HumiditySensor_MeasuredValue = (uint16)(bme_results.humidity * 100 / 1024);
-        bdb_RepChangedAttrValue(zclApp_FirstEP.EndPoint, TEMP, ATTRID_MS_TEMPERATURE_MEASURED_VALUE);
-        bdb_RepChangedAttrValue(zclApp_FirstEP.EndPoint, PRESSURE, ATTRID_MS_PRESSURE_MEASUREMENT_MEASURED_VALUE);
-        bdb_RepChangedAttrValue(zclApp_FirstEP.EndPoint, HUMIDITY, ATTRID_MS_RELATIVE_HUMIDITY_MEASURED_VALUE);
-    } else {
-        LREP("ReadBME280 read error %d\r\n", rslt);
-    }
-}
 static void zclApp_Report(void) { osal_start_timerEx(zclApp_TaskID, APP_READ_SENSORS_EVT, 10); }
 
 /****************************************************************************

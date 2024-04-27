@@ -11,7 +11,9 @@
 #define MULTICAST_ENABLED FALSE
 
 #define ZCL_READ
+#define ZCL_WRITE
 #define ZCL_BASIC
+#define ZCL_ON_OFF
 #define ZCL_IDENTIFY
 #define ZCL_REPORTING_DEVICE
 
